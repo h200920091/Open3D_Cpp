@@ -4,6 +4,8 @@
 #include <string>
 #include <fstream>
 #include <iomanip>
+#include <math.h>
+#include <filesystem>
 
 #include "open3d/Open3D.h"
 
@@ -19,29 +21,101 @@ vector<size_t> inliers;
 int foundParallelNum = 0;
 
 vector<double> segmentPlanesByRansac(string, int, double, bool, bool, bool, bool);
-void xyzRgbToPly(string, bool);
+void xyzRgbToPly(const char*);
+void xyzRgbToPlyCsv(string, int, int, int, int, int, int, int);
+extern "C" _declspec(dllexport) void createMeshFromTxt(int, const char*);
+extern "C" _declspec(dllexport) void createMeshFromCsv(int, const char*, int, int, int, int, int, int, int);
+void calPlanesDist(vector<double>);
+vector<double> sortingPlanes(vector<double>, bool);
+vector<double> sortingPlanesSelection(vector<double>, bool);
 double removeSegROI(shared_ptr<open3d::geometry::PointCloud>, double, bool, bool);
 shared_ptr<open3d::geometry::PointCloud> removeOutlier(shared_ptr<open3d::geometry::PointCloud>, int, float, bool);
 void createPoissonMeshSegment(string);
 
+
 int main(int argc, char* argv[]) {
 	utility::SetVerbosityLevel(utility::VerbosityLevel::Error);
 
-	string filePath = "D:\\zhihao\\Project\\SSI\\CPP\\test\\build\\Release\\waferglued_2.txt";
+	string filePath = "D:\\zhihao\\Project\\SSI\\CPP\\test\\build\\Release\\waferglued_2_test.csv";
 	string outputPath = "D:\\zhihao\\Project\\SSI\\CPP\\test\\build\\Release\\waferglued_2_pcd.ply";
 	string meshPath = "D:\\zhihao\\Project\\SSI\\CPP\\test\\build\\Release\\waferglued_2_mesh.ply";
 
-	xyzRgbToPly(filePath, FALSE);
-
 	auto planesThickness = segmentPlanesByRansac(outputPath, 6, 0.1, FALSE, TRUE, FALSE, FALSE);
+	calPlanesDist(planesThickness);
+	planesThickness = sortingPlanesSelection(planesThickness, TRUE);
 	createPoissonMeshSegment(filePath);
 
 	utility::LogInfo("End of the test.\n");
 	return 0;
 }
 
-void xyzRgbToPly(string inputFile, bool csv) {
+extern "C" _declspec(dllexport) void createMeshFromTxt(int layer, const char* inputFile) {
+	string path = inputFile;
+	string outputFile = path.substr(0, path.length() - 4) + +"_pcd.ply";
+	xyzRgbToPly(inputFile);
+	auto planesThickness = segmentPlanesByRansac(outputFile, layer, 0.1, FALSE, TRUE, FALSE, FALSE);
+	calPlanesDist(planesThickness);
+	planesThickness = sortingPlanesSelection(planesThickness, TRUE);
+	createPoissonMeshSegment(inputFile);
+}
+
+extern "C" _declspec(dllexport) void createMeshFromCsv(int layer, const char* inputFile, int x, int y, int z, int r, int g, int b, int noColor) {
+	string path = inputFile;
+	string outputFile = path.substr(0, path.length() - 4) + +"_pcd.ply";
+	xyzRgbToPlyCsv(inputFile, x, y, z, r, g, b, noColor);
+	auto planesThickness = segmentPlanesByRansac(outputFile, layer, 0.1, FALSE, TRUE, FALSE, FALSE);
+	calPlanesDist(planesThickness);
+	planesThickness = sortingPlanesSelection(planesThickness, TRUE);
+	createPoissonMeshSegment(inputFile);
+}
+
+void xyzRgbToPlyCsv(string inputFile, int x, int y, int z, int r, int g, int b, int noColor) {
+	vector<Eigen::Vector3d> data;
+	vector<Eigen::Vector3d> color;
 	string outputFile = inputFile.substr(0, inputFile.length() - 4) + +"_pcd.ply";
+	ifstream file(inputFile);
+	if (!file) {
+		cout << "開啟檔案失敗 !\n";
+		return;
+	}
+	string line;
+	getline(file, line);
+	while (getline(file, line)) {
+		stringstream s(line);
+		vector<double> temp;
+		while (s.good()) {
+			string sub;
+			getline(s, sub, ',');
+			if (sub != "") {
+				temp.push_back(atof(sub.c_str()));
+			}
+		}
+		data.push_back(Eigen::Vector3d(temp[x], temp[y], temp[z]));
+		if (!noColor)
+			color.push_back(Eigen::Vector3d(temp[r], temp[g], temp[b]));
+		else
+			color.push_back(Eigen::Vector3d(0, 0, 0));
+
+	}
+	cloudPtr->colors_ = color;
+	cloudPtr->points_ = data;
+	cout << "File Loaded !!\n" << endl;
+
+	auto search_param = geometry::KDTreeSearchParamKNN(250);
+	cloudPtr->EstimateNormals(search_param);
+
+	if (open3d::io::WritePointCloud(outputFile, *cloudPtr))
+	{
+		cout << "Saved as PLY !!\n\n";
+	}
+
+	if (!open3d::io::ReadPointCloud(outputFile, *cloudPtr)) { return; }
+	cout << "PLY File Loaded !!\n\n";
+}
+
+void xyzRgbToPly(const char* inputFile) {
+	string path = inputFile;
+	string outputFile = path.substr(0, path.length() - 4) + +"_pcd.ply";
 	auto pcdOption = open3d::io::ReadPointCloudOption::ReadPointCloudOption();
 
 	if (!open3d::io::ReadPointCloudFromXYZRGB(inputFile, *cloudPtr, pcdOption)) {
@@ -49,9 +123,6 @@ void xyzRgbToPly(string inputFile, bool csv) {
 		return;
 	}
 	cout << "File Loaded !!\n" << endl;
-
-	/* visualize PC */
-	//open3d::visualization::DrawGeometries({ cloudPtr });
 
 	auto search_param = geometry::KDTreeSearchParamKNN(250);
 	cloudPtr->EstimateNormals(search_param);
@@ -80,7 +151,7 @@ vector<double> segmentPlanesByRansac(string inputFile, int maxPlaneIdx = 6, doub
 			break;
 		segmentModels[idx] = get<0>(rest->SegmentPlane(0.03, 3, 1000));
 		inliers = get<1>(rest->SegmentPlane(0.03, 3, 1000));
-		cout << "Plane " << idx << " equation: " << setprecision(3) << segmentModels[idx][0] << "x + "
+		cout << "Plane " << idx << " equation: " << fixed << setprecision(3) << segmentModels[idx][0] << "x + "
 			<< segmentModels[idx][1] << "y + " << segmentModels[idx][2] << "z + " << segmentModels[idx][3] << " = 0\n";
 
 		// 先找是否為 Vertical plane
@@ -120,6 +191,7 @@ vector<double> segmentPlanesByRansac(string inputFile, int maxPlaneIdx = 6, doub
 	}
 
 	// sorting
+	planesThickness = sortingPlanes(planesThickness, TRUE);
 
 	return planesThickness;
 }
@@ -161,7 +233,11 @@ void createPoissonMeshSegment(string filePath) {
 	cout << "Testing IO for meshes ...\n";
 	auto currentMesh = geometry::TriangleMesh();
 	auto& app = gui::Application::GetInstance();
-	app.Initialize();
+	TCHAR NPath[MAX_PATH];
+	GetCurrentDirectory(MAX_PATH, NPath);
+	string path = NPath;
+	path += "/resources";
+	app.Initialize(path.c_str());
 	auto vis = std::make_shared<visualizer::O3DVisualizer>("Pcd and Mesh Visualization", 1024, 768);
 	vis->ShowSettings(TRUE);
 	vis->ShowSkybox(FALSE);
@@ -186,4 +262,135 @@ void createPoissonMeshSegment(string filePath) {
 	app.AddWindow(vis);
 	app.Run();
 
+}
+
+void calPlanesDist(vector<double> planesThickness) {
+	int countingPlaneNum = segmentModels.size();
+	int n = countingPlaneNum;
+	string splitLine = string(50, '=');
+	cout << splitLine << endl;
+	cout << "以 Segment 中心切面算距離:\n";
+	for (int i = 0; i < n; i++) {
+		for (int j = 0; j < n; j++) {
+			if (i != j && i < j) {
+				double a1 = segmentModels[i][0];
+				double b1 = segmentModels[i][1];
+				double c1 = segmentModels[i][2];
+				double d1 = segmentModels[i][3];
+				double a2 = segmentModels[j][0];
+				double b2 = segmentModels[j][1];
+				double c2 = segmentModels[j][2];
+				double d2 = segmentModels[j][3];
+				double a = (a1 + a2) / 2;
+				double b = (b1 + b2) / 2;
+				double c = (c1 + c2) / 2;
+				double d = abs(d1 - d2) / sqrt(a * a + b * b + c * c);
+				cout << "Distance between plane " << i << " and plane " << j << " is " << fixed << setprecision(3) << d * 1000 << " (miu m)\n";
+			}
+		}
+	}
+	cout << splitLine << endl;
+
+	double totalThickness = 0;
+	for (int i = 0; i < n - 1; i++) {
+		double a1 = segmentModels[i][0];
+		double b1 = segmentModels[i][1];
+		double c1 = segmentModels[i][2];
+		double d1 = segmentModels[i][3];
+		double a2 = segmentModels[i + 1][0];
+		double b2 = segmentModels[i + 1][1];
+		double c2 = segmentModels[i + 1][2];
+		double d2 = segmentModels[i + 1][3];
+		double a = (a1 + a2) / 2;
+		double b = (b1 + b2) / 2;
+		double c = (c1 + c2) / 2;
+		double d = abs(d1 - d2) / sqrt(a * a + b * b + c * c);
+		totalThickness += d;
+	}
+
+	cout << "以物件表面算間距:\n";
+	for (int i = 0; i < n - 1; i++) {
+		double a1 = segmentModels[i][0];
+		double b1 = segmentModels[i][1];
+		double c1 = segmentModels[i][2];
+		double d1 = segmentModels[i][3];
+		double a2 = segmentModels[i + 1][0];
+		double b2 = segmentModels[i + 1][1];
+		double c2 = segmentModels[i + 1][2];
+		double d2 = segmentModels[i + 1][3];
+		double a = (a1 + a2) / 2;
+		double b = (b1 + b2) / 2;
+		double c = (c1 + c2) / 2;
+		double d = abs(d1 - d2) / sqrt(a * a + b * b + c * c) - planesThickness[i] / 2 - planesThickness[i + 1] / 2;
+		cout << "Distance between plane " << i << " and plane " << i + 1 << " is " << fixed << setprecision(3) << d * 1000 << " (miu m)\n";
+	}
+	cout << splitLine << endl;
+	cout << "總厚度= " << fixed << setprecision(3) << totalThickness * 1000 << " (miu m)\n";
+	cout << splitLine << endl;
+}
+
+vector<double> sortingPlanes(vector<double> planesThickness, bool reverse = TRUE) {
+	int n = segments.size();
+	if (!reverse) {
+		for (int i = 0; i < n; i++) {
+			for (int j = 0; j < n - i - 1; j++) {
+				if (segmentModels[j][3] > segmentModels[j + 1][3]) {
+					swap(segments[j], segments[j + 1]);
+					swap(segmentModels[j], segmentModels[j + 1]);
+					swap(planesThickness[j], planesThickness[j + 1]);
+				}
+			}
+		}
+	}
+	else {
+		for (int i = 0; i < n; i++) {
+			for (int j = 0; j < n - i - 1; j++) {
+				if (segmentModels[j][3] < segmentModels[j + 1][3]) {
+					swap(segments[j], segments[j + 1]);
+					swap(segmentModels[j], segmentModels[j + 1]);
+					swap(planesThickness[j], planesThickness[j + 1]);
+					//auto temp1 = segments[j];
+					//segments[j] = segments[j + 1];
+					//segments[j + 1] = temp1;
+					//auto temp2 = segmentModels[j];
+					//segmentModels[j] = segmentModels[j + 1];
+					//segmentModels[j + 1] = temp2;
+					//auto temp3 = planesThickness[j];
+					//planesThickness[j] = planesThickness[j + 1];
+					//planesThickness[j + 1] = temp3;
+				}
+			}
+		}
+	}
+	return planesThickness;
+}
+
+vector<double> sortingPlanesSelection(vector<double> planesThickness, bool reverse = TRUE) {
+	int n = segments.size();
+	if (!reverse) {
+		for (int i = 0; i < n; i++) {
+			int minInx = i;
+			for (int j = i + 1; j < n; j++)
+				if (segments[minInx]->GetMinBound()[2] < segments[minInx]->GetMinBound()[2]) {
+					minInx = j;
+				}
+			swap(segments[i], segments[minInx]);
+			swap(segmentModels[i], segmentModels[minInx]);
+			swap(planesThickness[i], planesThickness[minInx]);
+		}
+	}
+	else {
+		for (int i = 0; i < n; i++) {
+			int minInx = i;
+			for (int j = i + 1; j < n; j++) {
+				if (segments[minInx]->GetMinBound()[2] > segments[j]->GetMinBound()[2]) {
+					minInx = j;
+				}
+			}
+			swap(segments[i], segments[minInx]);
+			swap(segmentModels[i], segmentModels[minInx]);
+			swap(planesThickness[i], planesThickness[minInx]);
+		}
+	}
+	return planesThickness;
 }
